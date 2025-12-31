@@ -58,7 +58,7 @@ class DatasystemStoreConfig:
         return cls(
             fast_transfer=(os.getenv("FAST_TRANSFER", "false").lower()
                            in ("true", "1", "yes")),
-            transfer_timeout=int(os.getenv("TRANSFER_TIMEOUT", "1")),
+            transfer_timeout=int(os.getenv("TRANSFER_TIMEOUT", "10")),
             ds_worker_addr=os.getenv("DS_WORKER_ADDR", "127.0.0.1:31501"),
         )
 
@@ -432,9 +432,16 @@ class ECMooncakeStore:
                                   self.set_param.write_mode),
                 timeout=self.config.transfer_timeout,
             )
+        except asyncio.TimeoutError:
+            logger.error(
+                "Failed to put bytes_list for keys %s: timedout after %s seconds",
+                ",".join(keys),
+                self.config.transfer_timeout,
+            )
         except Exception as e:
             logger.error(
-                "Failed to put bytes_list for keys %s with error %s",
+                "Failed to put bytes_list for keys with error type: %s, details: %s",
                 ",".join(keys),
+                type(e).__name__,
                 str(e),
             )
