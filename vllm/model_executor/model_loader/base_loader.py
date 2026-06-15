@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
+import time
 
 import torch
 import torch.nn as nn
@@ -51,17 +52,21 @@ class BaseModelLoader(ABC):
         )
         target_device = torch.device(load_device)
         with set_default_torch_dtype(model_config.dtype):
+            initialize_model_start = time.perf_counter()
             with target_device:
                 model = initialize_model(
                     vllm_config=vllm_config,
                     model_config=model_config,
                     prefix=prefix,
                 )
+            initialize_model_time = time.perf_counter() - initialize_model_start
 
             log_model_inspection(model)
 
             logger.debug("Loading weights on %s ...", load_device)
+            load_weights_start = time.perf_counter()
             self.load_weights(model, model_config)
+            load_weights_time = time.perf_counter() - load_weights_start
 
             # Log peak GPU memory after loading weights. This is needed
             # to have test coverage on peak memory for online quantization.
@@ -74,10 +79,27 @@ class BaseModelLoader(ABC):
 
             # Process weights into kernel format. Note that when using online
             # quantization, weights are (typically) quantized as they are loaded.
+            finalize_layerwise_start = time.perf_counter()
             if _has_online_quant(model):
                 finalize_layerwise_processing(model, model_config)
+            finalize_layerwise_time = time.perf_counter() - finalize_layerwise_start
 
+            process_weights_start = time.perf_counter()
             process_weights_after_loading(model, model_config, target_device)
+            process_weights_time = time.perf_counter() - process_weights_start
+
+            logger.info(
+                "BaseModelLoader load_model details: initialize_model=%.4fs, "
+                "load_weights=%.4fs, finalize_layerwise_processing=%.4fs, "
+                "process_weights_after_loading=%.4fs, load_device=%s, "
+                "quantization=%s",
+                initialize_model_time,
+                load_weights_time,
+                finalize_layerwise_time,
+                process_weights_time,
+                load_device,
+                model_config.quantization,
+            )
 
         return model.eval()
 

@@ -3,6 +3,7 @@
 """Utilities for selecting and loading models."""
 
 import inspect
+import time
 import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -95,7 +96,13 @@ def initialize_model(
 def process_weights_after_loading(
     model: nn.Module, model_config: ModelConfig, target_device: torch.device
 ) -> None:
+    total_start = time.perf_counter()
+    quant_loop_start = time.perf_counter()
+    quant_method_time = 0.0
+    quant_method_count = 0
+    quant_module_count = 0
     for _, module in model.named_modules():
+        quant_module_count += 1
         quant_method = getattr(module, "quant_method", None)
         if isinstance(quant_method, QuantizeMethodBase):
             # When quant methods need to process weights after loading
@@ -103,24 +110,59 @@ def process_weights_after_loading(
             # to be on the global target device. This scope is for the
             # case where cpu offloading is used, where we will move the
             # parameters onto device for processing and back off after.
+            quant_method_start = time.perf_counter()
             with device_loading_context(module, target_device):
                 quant_method.process_weights_after_loading(module)
+            quant_method_time += time.perf_counter() - quant_method_start
+            quant_method_count += 1
+    quant_loop_time = time.perf_counter() - quant_loop_start
 
     # Initialize post-load attention weights for both Attention and MLA.
     # NOTE: Happens after other modules so we can easily decompress weights.
+    attention_loop_start = time.perf_counter()
+    attention_method_time = 0.0
+    attention_method_count = 0
+    attention_module_count = 0
     for _, module in model.named_modules():
+        attention_module_count += 1
         if isinstance(module, (Attention, MLAAttention)) and hasattr(
             module, "process_weights_after_loading"
         ):
             # TODO(lucas): see if there is a way to unify the signatures
             # of process_weights_after_loading
+            attention_method_start = time.perf_counter()
             with device_loading_context(module, target_device):
                 module.process_weights_after_loading(model_config.dtype)
+            attention_method_time += time.perf_counter() - attention_method_start
+            attention_method_count += 1
+    attention_loop_time = time.perf_counter() - attention_loop_start
 
     # Needed for torchao model reloading via model.reload_weights
     # @kylesayrs @jerryzh168 this can be removed if callers move to `reload_weights`
+    torchao_reload_start = time.perf_counter()
     if model_config.quantization == "torchao":
         set_torchao_reload_attrs(model, model_config)
+    torchao_reload_time = time.perf_counter() - torchao_reload_start
+
+    logger.info(
+        "process_weights_after_loading details: total=%.4fs, "
+        "quant_loop=%.4fs, quant_methods=%.4fs/%d, "
+        "quant_modules=%d, attention_loop=%.4fs, "
+        "attention_methods=%.4fs/%d, attention_modules=%d, "
+        "torchao_reload_attrs=%.4fs, target_device=%s, quantization=%s",
+        time.perf_counter() - total_start,
+        quant_loop_time,
+        quant_method_time,
+        quant_method_count,
+        quant_module_count,
+        attention_loop_time,
+        attention_method_time,
+        attention_method_count,
+        attention_module_count,
+        torchao_reload_time,
+        target_device,
+        model_config.quantization,
+    )
 
 
 @contextmanager
