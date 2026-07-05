@@ -223,6 +223,7 @@ class MoERunner(MoERunnerInterface):
         shared_experts: torch.nn.Module | None,
         quant_method: FusedMoEMethodBase,
         enable_dbo: bool,
+        shared_expert_gate: torch.nn.Module | None = None,
         routed_output_transform: torch.nn.Module | None = None,
         routed_scaling_factor: float = 1.0,
     ):
@@ -233,8 +234,17 @@ class MoERunner(MoERunnerInterface):
         self.routed_output_transform = routed_output_transform
         self.routed_scaling_factor = routed_scaling_factor
         self.gate = gate
-        self.quant_method = quant_method
+        self.shared_expert_gate = shared_expert_gate
+        self._quant_method = quant_method
         self.enable_dbo = enable_dbo
+
+        # When both gates are present and FSE is enabled, fuse their
+        # weight matrices into [num_experts + num_shared, hidden] so one
+        # F.linear produces combined logits. The topk kernel can then
+        # apply routing softmax and shared expert activation (sigmoid)
+        # in a single launch.
+        self._fse_fuse_gate = gate is not None and shared_expert_gate is not None
+        self._combined_gate_weight: torch.Tensor | None = None
 
         self._shared_experts: SharedExperts | None = None
         if shared_experts is not None:
@@ -276,7 +286,21 @@ class MoERunner(MoERunnerInterface):
     def _replace_quant_method(self, quant_method: FusedMoEMethodBase):
         if self._shared_experts is not None:
             self._shared_experts._quant_method = quant_method
-        self.quant_method = quant_method
+        self._quant_method = quant_method
+
+    def _maybe_fuse_gate_weights(self):
+        """Fuse router and shared expert gate weights on first call.
+
+        Cannot be done at __init__ because gate weights are loaded after
+        module construction (via weight_loader). Called once from
+        _forward_impl before the first forward pass.
+        """
+        if self._combined_gate_weight is None:
+            assert self.gate is not None and self.shared_expert_gate is not None
+            self._combined_gate_weight = torch.cat(
+                [self.gate.weight, self.shared_expert_gate.weight],
+                dim=0,
+            )
 
     def is_internal_router(self) -> bool:
         return self.gate is not None
@@ -343,8 +367,8 @@ class MoERunner(MoERunnerInterface):
     @property
     def _fused_output_is_reduced(self) -> bool:
         return (
-            self.quant_method.moe_kernel is not None
-            and self.quant_method.moe_kernel.output_is_reduced()
+            self._quant_method.moe_kernel is not None
+            and self._quant_method.moe_kernel.output_is_reduced()
         )
 
     def _maybe_reduce_shared_expert_output(
@@ -417,7 +441,7 @@ class MoERunner(MoERunnerInterface):
             TrtLlmMxfp4ExpertsBase,
         )
 
-        moe_kernel = getattr(self.quant_method, "moe_kernel", None)
+        moe_kernel = getattr(self._quant_method, "moe_kernel", None)
         fused_experts = getattr(
             getattr(moe_kernel, "impl", None), "fused_experts", None
         )
@@ -443,7 +467,7 @@ class MoERunner(MoERunnerInterface):
         )
         transformed_hidden_dim = hidden_states.shape[-1]
         if (
-            not self.quant_method.skip_forward_padding
+            not self._quant_method.skip_forward_padding
             and self.moe_config.hidden_dim != transformed_hidden_dim
         ):
             hidden_states = F.pad(
@@ -487,8 +511,12 @@ class MoERunner(MoERunnerInterface):
             shared_experts_input, SharedExpertsOrder.NO_OVERLAP
         )
 
-        if self.quant_method.is_monolithic:
-            fused_out = self.quant_method.apply_monolithic(
+        # Get routing replay buffer from persistent layer attribute
+        # (set by bind_routing_capture_to_model during capturer init)
+        routing_replay_out = getattr(layer, "_routing_replay_out", None)
+
+        if self._quant_method.is_monolithic:
+            fused_out = self._quant_method.apply_monolithic(
                 layer=layer,
                 x=hidden_states,
                 router_logits=router_logits,
@@ -501,9 +529,13 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
 
+            # Write routing data for non-monolithic path (Triton, etc.)
+            if routing_replay_out is not None:
+                routing_replay_out[: topk_ids.shape[0]].copy_(topk_ids.to(torch.int16))
+
             # Passing shared_experts_input in case SharedExpertsOrder is
             # MK_INTERNAL_OVERLAPPED.
-            fused_out = self.quant_method.apply(
+            fused_out = self._quant_method.apply(
                 layer=layer,
                 x=hidden_states,
                 topk_weights=topk_weights,
@@ -655,7 +687,7 @@ class MoERunner(MoERunnerInterface):
     @property
     def do_naive_dispatch_combine(self) -> bool:
         return (
-            self.moe_config.dp_size > 1 and not self.quant_method.supports_internal_mk
+            self.moe_config.dp_size > 1 and not self._quant_method.supports_internal_mk
         )
 
     def _maybe_dispatch(
@@ -744,7 +776,11 @@ class MoERunner(MoERunnerInterface):
         # so it can run overlapped with the
         # NOTE: in future PR, MoE runner will always hold the gate.
         if self.gate is not None:
-            router_logits, _ = self.gate(hidden_states)
+            if self._fse_fuse_gate:
+                self._maybe_fuse_gate_weights()
+                router_logits = F.linear(hidden_states, self._combined_gate_weight)
+            else:
+                router_logits, _ = self.gate(hidden_states)
 
         with self._sequence_parallel_context():
             # TODO(bnell): parts of the dispatch/combine steps will go away once

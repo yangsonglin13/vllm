@@ -66,6 +66,7 @@ class Request:
         client_index: int = 0,
         arrival_time: float | None = None,
         prompt_embeds: torch.Tensor | None = None,
+        prompt_is_token_ids: list[bool] | None = None,
         mm_features: list[MultiModalFeatureSpec] | None = None,
         lora_request: "LoRARequest | None" = None,
         cache_salt: str | None = None,
@@ -75,6 +76,7 @@ class Request:
         resumable: bool = False,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
+        abort_immediately: bool = False,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -118,6 +120,10 @@ class Request:
 
         self.prompt_token_ids = prompt_token_ids
         self.prompt_embeds = prompt_embeds
+        # Per-position mask used in mixed-mode (chat completion with
+        # prompt_embeds). `None` except when both `prompt_token_ids` and
+        # `prompt_embeds` are set and their positions are interleaved.
+        self.prompt_is_token_ids = prompt_is_token_ids
         # Cache per-block prompt-embed hashes to avoid rehashing the same
         # tensor slices when generating extra keys.
         self._prompt_embeds_per_block_hashes: dict[tuple[int, int], bytes] = {}
@@ -177,6 +183,10 @@ class Request:
         # None entry in the queue means finished.
         self.streaming_queue: deque[StreamingUpdate | None] | None = None
 
+        # If True, request should be aborted immediately after being added to
+        # the scheduler so the connector's request_finished hook runs.
+        self.abort_immediately = abort_immediately
+
     @classmethod
     def from_engine_core_request(
         cls,
@@ -188,6 +198,7 @@ class Request:
             client_index=request.client_index,
             prompt_token_ids=request.prompt_token_ids,
             prompt_embeds=request.prompt_embeds,
+            prompt_is_token_ids=request.prompt_is_token_ids,
             mm_features=request.mm_features,
             sampling_params=request.sampling_params,
             pooling_params=request.pooling_params,
@@ -200,6 +211,7 @@ class Request:
             resumable=request.resumable,
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
+            abort_immediately=request.abort_immediately,
         )
 
     def append_output_token_ids(

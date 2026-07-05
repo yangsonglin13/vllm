@@ -141,8 +141,11 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
         hidden_states = self.h_proj(previous_hidden_states) + self.e_proj(
             inputs_embeds
         ).unsqueeze(-2)
-        hidden_states = self.mtp_block(
+        hidden_states, residual, post_mix, res_mix = self.mtp_block(
             positions=positions, x=hidden_states, input_ids=None
+        )
+        hidden_states = self.mtp_block.hc_post(
+            hidden_states, residual, post_mix, res_mix
         )
         # Return the flat pre-hc_head residual so it can be re-fed as the
         # next spec step's `previous_hidden_states` when
@@ -167,8 +170,12 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
         )
 
         # Three aux streams shared across all MTP layers, mirroring
-        # DeepseekV4Model.
-        aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
+        # DeepseekV4Model. ROCm runs the same work serially for now.
+        aux_stream_list = (
+            None
+            if current_platform.is_rocm()
+            else [torch.cuda.Stream() for _ in range(3)]
+        )
 
         # to map the exact layer index from weights
         self.layers = torch.nn.ModuleDict(

@@ -79,7 +79,7 @@ from vllm.renderers.inputs.preprocess import (
     prompt_to_seq,
 )
 from vllm.sampling_params import BeamSearchParams, RequestOutputKind, SamplingParams
-from vllm.tasks import PoolingTask
+from vllm.tasks import SCORE_TYPE_MAP, PoolingTask
 from vllm.tokenizers import TokenizerLike
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.counter import Counter
@@ -334,7 +334,7 @@ class LLM:
                 f"LLM(data_parallel_size={_dp_size}) is not supported for single-"
                 "process usage and may hang. Please use "
                 "the explicit multi-process data-parallel example at "
-                "'examples/offline_inference/data_parallel.py'."
+                "'examples/features/data_parallel/data_parallel_offline.py'."
             )
 
         engine_args = EngineArgs(
@@ -926,7 +926,10 @@ class LLM:
                     add_generation_prompt=add_generation_prompt,
                     continue_final_message=continue_final_message,
                     tools=tools,
-                    tokenize=is_mistral_tokenizer(renderer.tokenizer),
+                    tokenize=(
+                        is_mistral_tokenizer(renderer.tokenizer)
+                        or self.model_config.enable_prompt_embeds
+                    ),
                 ),
             ),
             mm_processor_kwargs=mm_processor_kwargs,
@@ -1204,12 +1207,9 @@ class LLM:
                     f"Supported tasks: {self.supported_tasks}"
                 )
             else:
-                logger.warning_once(
-                    "Pooling multitask support is deprecated and will "
-                    "be removed in v0.20. When the default pooling task is "
-                    "not what you want, you need to manually specify it "
-                    'via PoolerConfig(task="%s"). ',
-                    pooling_task,
+                raise ValueError(
+                    f"Try switching the model's pooling_task "
+                    f'via `PoolerConfig(task="{pooling_task}")`'
                 )
 
         if pooling_task == "plugin" and "plugin" not in self.pooling_io_processors:
@@ -1412,7 +1412,7 @@ class LLM:
                 "pooling model."
             )
 
-        score_type = self.model_config.score_type
+        score_type: str | None = SCORE_TYPE_MAP.get(self.pooling_task, None)  # type: ignore[arg-type]
         if (
             score_type == "cross-encoder"
             and getattr(self.model_config.hf_config, "num_labels", 0) != 1
@@ -1908,6 +1908,20 @@ class LLM:
             "init_weight_transfer_engine", kwargs={"init_info": init_info_dict}
         )
 
+    def start_weight_update(self, is_checkpoint_format: bool = True) -> None:
+        """
+        Start a new weight update.
+
+        Args:
+            is_checkpoint_format: Whether incoming weights are in checkpoint
+                format (need layerwise processing) or kernel format (direct
+                copy).
+        """
+        self.llm_engine.collective_rpc(
+            "start_weight_update",
+            kwargs={"is_checkpoint_format": is_checkpoint_format},
+        )
+
     def update_weights(self, request: WeightTransferUpdateRequest | dict) -> None:
         """
         Update the weights of the model.
@@ -1922,6 +1936,12 @@ class LLM:
         self.llm_engine.collective_rpc(
             "update_weights", kwargs={"update_info": update_info_dict}
         )
+
+    def finish_weight_update(self) -> None:
+        """
+        Finish the current weight update.
+        """
+        self.llm_engine.collective_rpc("finish_weight_update")
 
     def __repr__(self) -> str:
         """Return a transformers-style hierarchical view of the model."""
